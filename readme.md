@@ -1,3 +1,66 @@
+# Running it
+
+Start three nodes, each in its own terminal. Every node must be given the
+**identical** `--peers` list -- each process computes the hash ring
+independently from it, so a mismatched list means they disagree about who
+coordinates a key.
+
+```sh
+# terminal 1
+go run ./cmd/node --id=A --peers=A=localhost:8001,B=localhost:8002,C=localhost:8003
+
+# terminal 2
+go run ./cmd/node --id=B --peers=A=localhost:8001,B=localhost:8002,C=localhost:8003
+
+# terminal 3
+go run ./cmd/node --id=C --peers=A=localhost:8001,B=localhost:8002,C=localhost:8003
+```
+
+Then, from a fourth terminal, write and read a key:
+
+```sh
+# write via node A
+go run ./cmd/client --port=8001 --op=put --key=cart123 --value=laptop
+# -> {"clock":{"C":1}}
+
+# read the same key back via node B
+go run ./cmd/client --port=8002 --op=get --key=cart123
+# -> {"versions":[{"value":"laptop","clock":{"C":1}}]}
+
+# and via node C
+go run ./cmd/client --port=8003 --op=get --key=cart123
+# -> {"versions":[{"value":"laptop","clock":{"C":1}}]}
+```
+
+Note the returned clock is `{"C":1}` even though the write was sent to A:
+`cart123` hashes to C, so A forwarded the request and C coordinated it.
+Any node accepts a request for any key and relays it to that key's
+coordinator, so all three ports are interchangeable entry points.
+
+To run everything in one terminal instead, background the nodes:
+
+```sh
+PEERS="A=localhost:8001,B=localhost:8002,C=localhost:8003"
+go run ./cmd/node --id=A --peers=$PEERS &
+go run ./cmd/node --id=B --peers=$PEERS &
+go run ./cmd/node --id=C --peers=$PEERS &
+sleep 2   # let them bind their ports
+
+go run ./cmd/client --port=8001 --op=put --key=cart123 --value=laptop
+go run ./cmd/client --port=8002 --op=get --key=cart123
+
+kill %1 %2 %3   # stop the cluster
+```
+
+Tests:
+
+```sh
+go test ./...
+go test -race ./...
+```
+
+---
+
 Requirements
 - store and fetch data items against a primary key. (get and put ops over http)
 - consitent hashing to distribute load/keys across node

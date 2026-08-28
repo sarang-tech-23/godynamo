@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -35,6 +36,7 @@ type getResponse struct {
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	if coordinator := s.ring.Owner(key); coordinator != s.id {
+		fmt.Println("forwarding PUT for key", key, "to coordinator", coordinator)
 		s.forward(w, r, coordinator)
 		return
 	}
@@ -57,6 +59,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	if coordinator := s.ring.Owner(key); coordinator != s.id {
+		fmt.Println("forwarding GET for key", key, "to coordinator", coordinator)
 		s.forward(w, r, coordinator)
 		return
 	}

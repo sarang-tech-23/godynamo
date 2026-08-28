@@ -100,7 +100,7 @@ func TestDescends(t *testing.T) {
 			name: "concurrent clocks do not descend each other",
 			a:    VectorClock{"A": 2, "B": 1},
 			b:    VectorClock{"A": 2, "C": 1},
-			want: true,
+			want: false,
 		},
 	}
 	for _, c := range cases {

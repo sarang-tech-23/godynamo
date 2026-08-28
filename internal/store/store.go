@@ -1,7 +1,10 @@
 // Package store implements the local per-node storage of versioned values.
 package store
 
-import "godynamo/internal/version"
+import (
+	"fmt"
+	"godynamo/internal/version"
+)
 
 // VersionedValue is a value together with the vector clock describing its
 // causal history.
@@ -33,5 +36,6 @@ func CoordinatorPut(s Store, key string, value []byte, context version.VectorClo
 	if err := s.Put(key, v); err != nil {
 		return VersionedValue{}, err
 	}
+	fmt.Println("coordinator put for key", key, "with clock", v.Clock)
 	return v, nil
 }
