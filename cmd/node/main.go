@@ -19,11 +19,19 @@ func main() {
 	var (
 		id    = flag.String("id", "", "this node's ID (required)")
 		peers = flag.String("peers", "", "comma-separated id=host:port pairs for every node in the cluster, e.g. A=localhost:8001,B=localhost:8002 (required; must be identical across every node's process)")
+		n     = flag.Int("n", 3, "replication factor")
+		rq    = flag.Int("r", 2, "replicas that must answer a read")
+		wq    = flag.Int("w", 2, "replicas that must acknowledge a write")
 	)
 	flag.Parse()
 
 	if *id == "" || *peers == "" {
 		log.Fatal("--id and --peers are required")
+	}
+
+	cfg := transport.Config{N: *n, R: *rq, W: *wq}
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("invalid quorum config: %v", err)
 	}
 
 	addrs, err := parsePeers(*peers)
@@ -43,9 +51,9 @@ func main() {
 
 	r := ring.New(members)
 	s := store.NewMemory()
-	srv := transport.NewServer(*id, addrs, r, s)
+	srv := transport.NewServer(*id, addrs, r, s, cfg)
 
-	log.Printf("node %s listening on %s (peers: %v)", *id, addr, addrs)
+	log.Printf("node %s listening on %s (N=%d R=%d W=%d, peers: %v)", *id, addr, cfg.N, cfg.R, cfg.W, addrs)
 	log.Fatal(http.ListenAndServe(addr, srv.Handler()))
 }
 

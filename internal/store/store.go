@@ -29,10 +29,29 @@ type Store interface {
 // merge rule any replica applies. It returns the version that was written
 // so the caller can forward the identical bytes to replica nodes.
 func CoordinatorPut(s Store, key string, value []byte, context version.VectorClock, nodeID string) (VersionedValue, error) {
-	v := VersionedValue{
-		Value: value,
-		Clock: version.Increment(context, nodeID),
+	existing, err := s.Get(key)
+	if err != nil {
+		return VersionedValue{}, err
 	}
+
+	clock := version.Increment(context, nodeID)
+
+	// The coordinator's own counter must also advance past anything it has
+	// already issued for this key. Without this, a client writing with no
+	// context (or a stale one) would regenerate a clock identical to a
+	// stored version, and Put would discard the write as a duplicate.
+	//
+	// Note the consequence: two concurrent writes coordinated by the *same*
+	// node are serialised rather than kept as siblings. That matches the
+	// paper -- siblings arise when *different* nodes coordinate writes to
+	// the same key, which is what happens under partition or failover.
+	for _, e := range existing {
+		if e.Clock[nodeID] >= clock[nodeID] {
+			clock[nodeID] = e.Clock[nodeID] + 1
+		}
+	}
+
+	v := VersionedValue{Value: value, Clock: clock}
 	if err := s.Put(key, v); err != nil {
 		return VersionedValue{}, err
 	}

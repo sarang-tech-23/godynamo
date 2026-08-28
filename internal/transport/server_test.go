@@ -14,23 +14,79 @@ import (
 	"godynamo/internal/transport"
 )
 
-// listen opens a loopback listener and registers its address under id in
-// addrs. Every listener needed by a test must be opened -- and addrs fully
-// populated -- before any server goroutine starts, so there is no
-// concurrent access to the map: the map is written only by the test
-// goroutine, and only ever read afterwards, by goroutines that start later.
-func listen(t *testing.T, addrs map[string]string, id string) net.Listener {
+// cluster is a set of in-process nodes, each on its own real loopback
+// listener. Nodes talk to each other over genuine TCP, so the transport
+// code under test is exercised exactly as it would be across processes.
+type cluster struct {
+	addrs  map[string]string
+	stores map[string]*store.Memory
+	ring   *ring.Ring
+}
+
+// startCluster brings up one node per id, skipping any id in `down` --
+// those get an address registered but nothing listening on it, which is
+// how a failed node looks to its peers.
+//
+// Every listener is opened and every address registered before any server
+// goroutine starts, so the shared addrs map is written only by the test
+// goroutine and read only afterwards: no synchronisation needed.
+func startCluster(t *testing.T, cfg transport.Config, ids []string, down map[string]bool) *cluster {
 	t.Helper()
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
+
+	addrs := make(map[string]string, len(ids))
+	listeners := make(map[string]net.Listener, len(ids))
+	for _, id := range ids {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { lis.Close() })
+		addrs[id] = lis.Addr().String()
+		listeners[id] = lis
+	}
+
+	r := ring.New(ids)
+	stores := make(map[string]*store.Memory, len(ids))
+	for _, id := range ids {
+		st := store.NewMemory()
+		stores[id] = st
+		if down[id] {
+			listeners[id].Close() // registered, but refuses connections
+			continue
+		}
+		srv := transport.NewServer(id, addrs, r, st, cfg)
+		go http.Serve(listeners[id], srv.Handler())
+	}
+
+	return &cluster{addrs: addrs, stores: stores, ring: r}
+}
+
+func (c *cluster) put(t *testing.T, viaNode, key, value string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut,
+		"http://"+c.addrs[viaNode]+"/kv/"+key,
+		strings.NewReader(fmt.Sprintf(`{"value":%q}`, value)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { lis.Close() })
-	addrs[id] = lis.Addr().String()
-	return lis
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
 }
 
-// keyOwnedBy finds a key that the ring assigns to nodeID.
+func (c *cluster) get(t *testing.T, viaNode, key string) *http.Response {
+	t.Helper()
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get("http://" + c.addrs[viaNode] + "/kv/" + key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// keyOwnedBy finds a key whose coordinator (first preference-list entry)
+// is nodeID.
 func keyOwnedBy(r *ring.Ring, nodeID string) string {
 	for i := 0; ; i++ {
 		key := fmt.Sprintf("key-%d", i)
@@ -40,107 +96,169 @@ func keyOwnedBy(r *ring.Ring, nodeID string) string {
 	}
 }
 
-func TestServer_ForwardsWriteAndReadToCoordinator(t *testing.T) {
-	addrs := make(map[string]string)
-	lisA := listen(t, addrs, "A")
-	lisB := listen(t, addrs, "B")
+func TestWrite_ReplicatesToAllPreferredNodes(t *testing.T) {
+	ids := []string{"A", "B", "C"}
+	c := startCluster(t, transport.Config{N: 3, R: 2, W: 2}, ids, nil)
 
-	r := ring.New([]string{"A", "B"})
-	storeA := store.NewMemory()
-	storeB := store.NewMemory()
+	key := "cart123"
+	resp := c.put(t, "A", key, "laptop")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200", resp.StatusCode)
+	}
 
-	srvA := transport.NewServer("A", addrs, r, storeA)
-	srvB := transport.NewServer("B", addrs, r, storeB)
-	go http.Serve(lisA, srvA.Handler())
-	go http.Serve(lisB, srvB.Handler())
+	// With N=3 on a 3-node cluster, every node should end up holding it.
+	for _, id := range ids {
+		versions, _ := c.stores[id].Get(key)
+		if len(versions) != 1 || string(versions[0].Value) != "laptop" {
+			t.Errorf("node %s holds %v, want one version %q", id, versions, "laptop")
+		}
+	}
+}
 
-	key := keyOwnedBy(r, "B")
-	client := &http.Client{Timeout: 2 * time.Second}
+func TestWrite_SucceedsWithOneReplicaDown(t *testing.T) {
+	ids := []string{"A", "B", "C"}
+	r := ring.New(ids)
+	key := "cart123"
+	pref := r.PreferenceList(key, 3)
 
-	// Send the write to A even though B owns this key -- A must forward.
-	putReq, err := http.NewRequest(http.MethodPut, "http://"+addrs["A"]+"/kv/"+key, strings.NewReader(`{"value":"v1"}`))
-	if err != nil {
+	// Take down the *last* preferred replica: the coordinator survives, so
+	// W=2 is still reachable via the coordinator plus one other.
+	c := startCluster(t, transport.Config{N: 3, R: 2, W: 2}, ids, map[string]bool{pref[2]: true})
+
+	resp := c.put(t, pref[0], key, "laptop")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200 (W=2 should tolerate one node down)", resp.StatusCode)
+	}
+
+	var body struct{ Replicas int }
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body.Replicas != 2 {
+		t.Errorf("replicas = %d, want 2", body.Replicas)
+	}
+}
+
+func TestWrite_FailsWhenQuorumUnreachable(t *testing.T) {
+	ids := []string{"A", "B", "C"}
+	r := ring.New(ids)
+	key := "cart123"
+	pref := r.PreferenceList(key, 3)
+
+	// W=3 requires every replica, so one node down must fail the write.
+	c := startCluster(t, transport.Config{N: 3, R: 2, W: 3}, ids, map[string]bool{pref[2]: true})
+
+	resp := c.put(t, pref[0], key, "laptop")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("PUT status = %d, want 503 (W=3 cannot be met with one node down)", resp.StatusCode)
+	}
+}
+
+func TestRead_ReturnsValueViaAnyNode(t *testing.T) {
+	ids := []string{"A", "B", "C"}
+	c := startCluster(t, transport.Config{N: 3, R: 2, W: 2}, ids, nil)
+
+	key := "cart123"
+	c.put(t, "A", key, "laptop").Body.Close()
+
+	// Every node is a valid entry point, coordinator or not.
+	for _, via := range ids {
+		resp := c.get(t, via, key)
+		var body struct {
+			Versions []struct{ Value string }
+			Replicas int
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET via %s: status %d, want 200", via, resp.StatusCode)
+		}
+		if len(body.Versions) != 1 || body.Versions[0].Value != "laptop" {
+			t.Errorf("GET via %s returned %+v, want one version %q", via, body.Versions, "laptop")
+		}
+	}
+}
+
+func TestRead_FailsWhenQuorumUnreachable(t *testing.T) {
+	ids := []string{"A", "B", "C"}
+	r := ring.New(ids)
+	key := "cart123"
+	pref := r.PreferenceList(key, 3)
+
+	// R=3 with one replica down cannot be satisfied.
+	c := startCluster(t, transport.Config{N: 3, R: 3, W: 2}, ids, map[string]bool{pref[2]: true})
+
+	resp := c.get(t, pref[0], key)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("GET status = %d, want 503", resp.StatusCode)
+	}
+}
+
+func TestRead_ReconcilesStaleReplica(t *testing.T) {
+	ids := []string{"A", "B", "C"}
+	c := startCluster(t, transport.Config{N: 3, R: 2, W: 2}, ids, nil)
+
+	key := "cart123"
+	c.put(t, "A", key, "v1").Body.Close()
+	c.put(t, "A", key, "v2").Body.Close()
+
+	// Plant an older version directly on one replica, as if it had missed
+	// the second write. The read must discard it rather than report a
+	// conflict, since it is an ancestor of what the others hold.
+	stale := store.VersionedValue{Value: []byte("stale"), Clock: nil}
+	if err := c.stores["B"].Put(key, stale); err != nil {
 		t.Fatal(err)
 	}
-	putResp, err := client.Do(putReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	putResp.Body.Close()
-	if putResp.StatusCode != http.StatusOK {
-		t.Fatalf("PUT via non-coordinator A: status %d", putResp.StatusCode)
-	}
 
-	// The value must have landed on B (the real coordinator), not A.
-	if got, _ := storeB.Get(key); len(got) != 1 || string(got[0].Value) != "v1" {
-		t.Fatalf("expected coordinator B to store the value, got %v", got)
-	}
-	if got, _ := storeA.Get(key); len(got) != 0 {
-		t.Fatalf("non-coordinator A should not store the value, got %v", got)
-	}
-
-	// Read the same key back through A again -- must also forward.
-	getResp, err := client.Get("http://" + addrs["A"] + "/kv/" + key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer getResp.Body.Close()
-	if getResp.StatusCode != http.StatusOK {
-		t.Fatalf("GET via non-coordinator A: status %d", getResp.StatusCode)
-	}
+	resp := c.get(t, c.ring.Owner(key), key)
+	defer resp.Body.Close()
 	var body struct {
 		Versions []struct{ Value string }
 	}
-	if err := json.NewDecoder(getResp.Body).Decode(&body); err != nil {
-		t.Fatal(err)
-	}
-	if len(body.Versions) != 1 || body.Versions[0].Value != "v1" {
-		t.Fatalf("GET via A returned %+v, want [{v1}]", body.Versions)
-	}
-}
+	json.NewDecoder(resp.Body).Decode(&body)
 
-func TestServer_HandlesLocallyWhenAlreadyCoordinator(t *testing.T) {
-	addrs := make(map[string]string)
-	lisA := listen(t, addrs, "A")
-	lisB := listen(t, addrs, "B")
-	_ = lisB // never started; A must not need to reach B for its own keys
-
-	r := ring.New([]string{"A", "B"})
-	srvA := transport.NewServer("A", addrs, r, store.NewMemory())
-	go http.Serve(lisA, srvA.Handler())
-
-	key := keyOwnedBy(r, "A")
-	client := &http.Client{Timeout: 2 * time.Second}
-
-	resp, err := client.Get("http://" + addrs["A"] + "/kv/" + key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET for A's own key: status %d (should not have tried to forward)", resp.StatusCode)
+	if len(body.Versions) != 1 || body.Versions[0].Value != "v2" {
+		t.Fatalf("got %+v, want a single version %q", body.Versions, "v2")
 	}
 }
 
-func TestServer_ForwardFailsWhenCoordinatorUnreachable(t *testing.T) {
-	addrs := make(map[string]string)
-	lisA := listen(t, addrs, "A")
-	lisB := listen(t, addrs, "B")
-	lisB.Close() // B is registered but nothing is listening: "down"
-
-	r := ring.New([]string{"A", "B"})
-	srvA := transport.NewServer("A", addrs, r, store.NewMemory())
-	go http.Serve(lisA, srvA.Handler())
-
+func TestForward_FailsWhenCoordinatorUnreachable(t *testing.T) {
+	ids := []string{"A", "B"}
+	r := ring.New(ids)
 	key := keyOwnedBy(r, "B")
-	client := &http.Client{Timeout: 2 * time.Second}
 
-	resp, err := client.Get("http://" + addrs["A"] + "/kv/" + key)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// B coordinates this key but is down; A can only report a bad gateway.
+	c := startCluster(t, transport.Config{N: 2, R: 1, W: 1}, ids, map[string]bool{"B": true})
+
+	resp := c.get(t, "A", key)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+	}
+}
+
+func TestConfigValidate(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfg     transport.Config
+		wantErr bool
+	}{
+		{"default is valid", transport.DefaultConfig(), false},
+		{"R may equal N", transport.Config{N: 3, R: 3, W: 1}, false},
+		{"N below one", transport.Config{N: 0, R: 1, W: 1}, true},
+		{"R above N", transport.Config{N: 3, R: 4, W: 2}, true},
+		{"W below one", transport.Config{N: 3, R: 2, W: 0}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := c.cfg.Validate(); (err != nil) != c.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, c.wantErr)
+			}
+		})
 	}
 }

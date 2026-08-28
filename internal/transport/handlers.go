@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -13,7 +14,10 @@ import (
 	"godynamo/internal/version"
 )
 
-const forwardTimeout = 2 * time.Second
+const (
+	forwardTimeout = 2 * time.Second
+	quorumTimeout  = 2 * time.Second
+)
 
 type putRequest struct {
 	Value   string              `json:"value"`
@@ -21,7 +25,8 @@ type putRequest struct {
 }
 
 type putResponse struct {
-	Clock version.VectorClock `json:"clock"`
+	Clock    version.VectorClock `json:"clock"`
+	Replicas int                 `json:"replicas"` // how many held the write
 }
 
 type versionDTO struct {
@@ -30,13 +35,23 @@ type versionDTO struct {
 }
 
 type getResponse struct {
-	Versions []versionDTO `json:"versions"`
+	Versions []versionDTO        `json:"versions"`
+	Context  version.VectorClock `json:"context"` // echo back on the next write
+	Replicas int                 `json:"replicas"`
 }
 
+// handlePut coordinates a write: increment the clock, store locally, then
+// replicate to the rest of the preference list until W is satisfied.
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	if coordinator := s.ring.Owner(key); coordinator != s.id {
-		fmt.Println("forwarding PUT for key", key, "to coordinator", coordinator)
+
+	replicas := s.ring.PreferenceList(key, s.cfg.N)
+	if len(replicas) == 0 {
+		http.Error(w, "ring has no members", http.StatusInternalServerError)
+		return
+	}
+	if coordinator := replicas[0]; coordinator != s.id {
+		log.Printf("PUT %s: forwarding to coordinator %s", key, coordinator)
 		s.forward(w, r, coordinator)
 		return
 	}
@@ -53,25 +68,72 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, putResponse{Clock: v.Clock})
+	ctx, cancel := context.WithTimeout(r.Context(), quorumTimeout)
+	defer cancel()
+
+	// The local write already counts as one, so W-1 more are needed.
+	held := 1 + s.replicate(ctx, key, v, replicas[1:], s.cfg.W-1)
+	log.Printf("PUT %s: clock=%v held by %d/%d replicas (W=%d)", key, v.Clock, held, len(replicas), s.cfg.W)
+
+	if held < s.cfg.W {
+		// The value is durable here even though we report failure -- the
+		// client cannot assume either way, which is exactly why writes
+		// must be idempotent and carry a context.
+		http.Error(w, fmt.Sprintf("write quorum not met: %d of %d replicas", held, s.cfg.W),
+			http.StatusServiceUnavailable)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, putResponse{Clock: v.Clock, Replicas: held})
 }
 
+// handleGet coordinates a read: fan out to the whole preference list, wait
+// for R answers, then reduce everything seen to the causally current set.
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	if coordinator := s.ring.Owner(key); coordinator != s.id {
-		fmt.Println("forwarding GET for key", key, "to coordinator", coordinator)
+
+	replicas := s.ring.PreferenceList(key, s.cfg.N)
+	if len(replicas) == 0 {
+		http.Error(w, "ring has no members", http.StatusInternalServerError)
+		return
+	}
+	if coordinator := replicas[0]; coordinator != s.id {
+		log.Printf("GET %s: forwarding to coordinator %s", key, coordinator)
 		s.forward(w, r, coordinator)
 		return
 	}
 
-	versions, err := s.store.Get(key)
+	local, err := s.store.Get(key)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	resp := getResponse{Versions: make([]versionDTO, len(versions))}
-	for i, v := range versions {
+	ctx, cancel := context.WithTimeout(r.Context(), quorumTimeout)
+	defer cancel()
+
+	remote, responded := s.gather(ctx, key, replicas[1:], s.cfg.R-1)
+	answered := 1 + responded // the local read counts as one
+
+	if answered < s.cfg.R {
+		http.Error(w, fmt.Sprintf("read quorum not met: %d of %d replicas", answered, s.cfg.R),
+			http.StatusServiceUnavailable)
+		return
+	}
+
+	all := make([]store.VersionedValue, 0, len(local)+len(remote))
+	all = append(all, local...)
+	all = append(all, remote...)
+	current := store.Reconcile(all)
+
+	log.Printf("GET %s: %d replicas answered, %d version(s) after reconciliation", key, answered, len(current))
+
+	resp := getResponse{
+		Versions: make([]versionDTO, len(current)),
+		Context:  store.ContextOf(current),
+		Replicas: answered,
+	}
+	for i, v := range current {
 		resp.Versions[i] = versionDTO{Value: string(v.Value), Clock: v.Clock}
 	}
 	writeJSON(w, http.StatusOK, resp)
